@@ -2311,17 +2311,37 @@ def _register_tool_run_api(mcp: FastMCP, os: "AgentOS", timeout_seconds: float) 
         return _json(payload, status_code=status_code)
 
     def _denied(request: Request) -> Optional[Response]:
-        """401 when the transport is gated but this request carries no credential.
+        """401 unless this request carries a VERIFIED identity on a gated server.
 
-        The gate itself stays with the transport middleware, which sees the verified
-        identity. This only refuses a request that could not possibly have one, so an
-        unauthenticated caller gets a 401 instead of a tool run.
+        A bearer header is not evidence of anything: fastmcp wraps only the ``/mcp``
+        transport route in its ``RequireAuthMiddleware``, and ``MCPConfig.authorize`` is
+        registered with ``only_path="/mcp"``, so neither runs for this custom route. Under
+        ``mcp_auth`` the provider still verifies the token before the app is reached and
+        publishes the result on ``scope["user"]``; under the REST gates the parent
+        AuthMiddleware sets ``request.state.user_id``. Trusting the raw header instead let a
+        caller run any published tool with ``Authorization: Bearer anything``.
+
+        Fail closed: on a gated server a request with no verified principal is refused.
         """
         if _mcp_server_is_open(os):
             return None
-        if request.headers.get("authorization"):
+        # fastmcp's verifier populates scope["user"] with the verified token; the REST
+        # AuthMiddleware and the identity bridge populate request.state.
+        access_token = getattr(request.scope.get("user"), "access_token", None)
+        state = request.scope.get("state") or {}
+        identified = (
+            access_token is not None
+            or getattr(request.state, "user_id", None) is not None
+            or state.get("user_id") is not None
+            or getattr(request.state, "authenticated", False) is True
+        )
+        if identified:
             return None
-        return _failed("unauthorized", "This MCP server requires an Authorization header.", 401)
+        return _failed(
+            "unauthorized",
+            "This MCP server requires an authenticated caller.",
+            401,
+        )
 
     @mcp.custom_route(MCP_TOOL_RUN_PATH, methods=["POST"], include_in_schema=False)
     async def run_published_tool(request: Request) -> Response:

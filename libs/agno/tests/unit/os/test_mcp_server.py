@@ -2191,6 +2191,57 @@ async def test_tool_run_api_does_not_claim_a_sibling_path():
         assert (await client.get("/mcp/server/toolshed")).status_code == 404
 
 
+async def test_tool_run_api_refuses_an_unverified_bearer_token():
+    """A bearer header is not evidence: the token must have been verified.
+
+    fastmcp wraps only the ``/mcp`` transport route in RequireAuthMiddleware and
+    ``MCPConfig.authorize`` is registered with ``only_path="/mcp"``, so neither runs for
+    this custom route. Accepting any request that merely carries an Authorization header
+    let a caller run every published tool with ``Bearer anything``.
+    """
+    from fastmcp.server.auth.providers.jwt import JWTVerifier
+
+    def _ran() -> str:
+        """Returns a marker."""
+        return "ran"
+
+    verifier = JWTVerifier(
+        public_key="-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"
+        + ("A" * 64)
+        + "\n-----END PUBLIC KEY-----",
+        issuer="https://issuer.example",
+        audience="test",
+    )
+    os = AgentOS(agents=[_agent()], mcp=MCPConfig(tools=[_ran]), mcp_auth=verifier)
+    app = get_mcp_server(os)
+
+    async with _mcp_client(app, base_url="http://localhost") as client:
+        forged = await client.post(
+            "/mcp/server/tools/_ran/run", json={"arguments": {}}, headers={"Authorization": "Bearer forged"}
+        )
+        anonymous = await client.post("/mcp/server/tools/_ran/run", json={"arguments": {}})
+
+    for response in (forged, anonymous):
+        assert response.status_code == 401, response.text
+        assert response.json()["error"] == "unauthorized"
+        assert "ran" not in response.text
+
+
+def test_a_transport_path_may_not_sit_inside_another_paths_sub_routes():
+    """Reserved sub-routes are a subtree, not one exact prefix.
+
+    ``/mcp/server/tools`` sits under ``/mcp``'s ``/server`` just as ``/mcp/server`` does;
+    an alias there would swallow requests meant for the transport.
+    """
+    for alias in ("/mcp/server", "/mcp/server/tools", "/mcp/server/tools/deeper", "/mcp/server-card"):
+        with pytest.raises(ValueError, match="must not overlap"):
+            MCPConfig(default_tools=True, path="/mcp", path_aliases=[alias])
+
+    # A path that merely shares a prefix is not inside the subtree.
+    MCPConfig(default_tools=True, path="/mcp/servertools")
+    MCPConfig(default_tools=True, path="/mcp", path_aliases=["/legacy"])
+
+
 def test_server_path_may_not_collide_with_a_transport_path():
     """One alias may not sit on another's ``/server`` subtree, which would shadow the runner."""
     with pytest.raises(ValueError, match="must not overlap"):

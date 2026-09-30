@@ -108,10 +108,16 @@ class MCPConfig(BaseModel):
             if not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+", path):
                 raise ValueError("MCP paths must be non-root absolute paths with plain segments; use root_host for /")
         paths = [self.path, *self.path_aliases]
-        # A transport path that collides with another path's card or tools route would be
-        # shadowed by it, so one alias can never sit on another's sub-routes.
+        # A transport path that lands anywhere inside another path's reserved sub-routes
+        # would be shadowed by them, so compare against the whole subtree rather than the
+        # exact prefix: "/mcp/server/tools" sits under "/mcp"'s "/server" just as
+        # "/mcp/server" does, and either would swallow requests meant for the transport.
+        reserved = ("/server-card", "/server")
         if len(set(paths)) != len(paths) or any(
-            p + suffix in paths for p in paths for suffix in ("/server-card", "/server")
+            other == p + suffix or other.startswith(p + suffix + "/")
+            for p in paths
+            for suffix in reserved
+            for other in paths
         ):
             raise ValueError("MCP transport, server-card and server paths must not overlap")
         if self.root_host is not None:
