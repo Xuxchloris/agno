@@ -2253,7 +2253,9 @@ def _tool_result_payload(result: Any) -> Dict[str, Any]:
     return payload
 
 
-def _register_tool_run_api(mcp: FastMCP, os: "AgentOS", timeout_seconds: float) -> None:
+def _register_tool_run_api(
+    mcp: FastMCP, os: "AgentOS", timeout_seconds: float, mcp_config: "Optional[MCPConfig]" = None
+) -> None:
     """Register the plain-HTTP tool runner.
 
     This exists for an operator UI that tests a tool the way MCP Inspector does, without
@@ -2311,37 +2313,40 @@ def _register_tool_run_api(mcp: FastMCP, os: "AgentOS", timeout_seconds: float) 
         return _json(payload, status_code=status_code)
 
     def _denied(request: Request) -> Optional[Response]:
-        """401 unless this request carries a VERIFIED identity on a gated server.
+        """401 unless this request carries a VERIFIED identity that ``authorize`` accepts.
 
-        A bearer header is not evidence of anything: fastmcp wraps only the ``/mcp``
-        transport route in its ``RequireAuthMiddleware``, and ``MCPConfig.authorize`` is
-        registered with ``only_path="/mcp"``, so neither runs for this custom route. Under
-        ``mcp_auth`` the provider still verifies the token before the app is reached and
-        publishes the result on ``scope["user"]``; under the REST gates the parent
-        AuthMiddleware sets ``request.state.user_id``. Trusting the raw header instead let a
-        caller run any published tool with ``Authorization: Bearer anything``.
+        Neither of the server's own gates covers this route: fastmcp wraps only the ``/mcp``
+        transport route in its ``RequireAuthMiddleware``, and under ``mcp_auth`` the
+        ``authorize`` gate is registered with ``only_path="/mcp"``, an exact match. So both
+        checks are made here.
 
-        Fail closed: on a gated server a request with no verified principal is refused.
+        Only a token the server itself verified counts. ``request.state.user_id`` is NOT
+        evidence: with ``user_isolation`` and no REST auth, ``NoAuthIdentityMiddleware``
+        copies a caller-supplied ``?user_id=`` straight onto it, and treating that as a
+        principal let an anonymous request run any published tool. The verified signals are
+        fastmcp's ``scope["user"].access_token`` and the ``authenticated`` flag that the
+        auth middleware sets only after it checks a credential.
+
+        Fail closed: on a gated server, no verified principal means no tool run.
         """
         if _mcp_server_is_open(os):
             return None
-        # fastmcp's verifier populates scope["user"] with the verified token; the REST
-        # AuthMiddleware and the identity bridge populate request.state.
+
+        # Verified-only. A self-asserted id never reaches either of these.
         access_token = getattr(request.scope.get("user"), "access_token", None)
         state = request.scope.get("state") or {}
-        identified = (
-            access_token is not None
-            or getattr(request.state, "user_id", None) is not None
-            or state.get("user_id") is not None
-            or getattr(request.state, "authenticated", False) is True
-        )
-        if identified:
-            return None
-        return _failed(
-            "unauthorized",
-            "This MCP server requires an authenticated caller.",
-            401,
-        )
+        authenticated = bool(getattr(request.state, "authenticated", False) or state.get("authenticated"))
+        if access_token is None and not authenticated:
+            return _failed("unauthorized", "This MCP server requires an authenticated caller.", 401)
+
+        # The operator's per-call predicate, which the transport applies at /mcp and which
+        # must not be weaker here. user_id is only trusted once the checks above pass.
+        authorize = mcp_config.authorize if mcp_config is not None else None
+        if authorize is not None:
+            user_id = getattr(request.state, "user_id", None) or state.get("user_id")
+            if not authorize(user_id):
+                return _failed("unauthorized", "Not authorized for the MCP server.", 401)
+        return None
 
     @mcp.custom_route(MCP_TOOL_RUN_PATH, methods=["POST"], include_in_schema=False)
     async def run_published_tool(request: Request) -> Response:
@@ -2494,6 +2499,7 @@ def build_mcp_server(
             timeout_seconds=(
                 mcp_config.tool_run_timeout_seconds if mcp_config is not None else _DEFAULT_TOOL_RUN_TIMEOUT_SECONDS
             ),
+            mcp_config=mcp_config,
         )
 
     # Classify the tool surface up front: the enabled default-tool tags depend on

@@ -2227,6 +2227,68 @@ async def test_tool_run_api_refuses_an_unverified_bearer_token():
         assert "ran" not in response.text
 
 
+def _jwt_verifier():
+    from fastmcp.server.auth.providers.jwt import JWTVerifier
+
+    return JWTVerifier(
+        public_key="-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"
+        + ("A" * 64)
+        + "\n-----END PUBLIC KEY-----",
+        issuer="https://issuer.example",
+        audience="test",
+    )
+
+
+async def test_tool_run_api_refuses_a_self_asserted_query_string_identity():
+    """``?user_id=`` is a claim, not a credential.
+
+    With ``user_isolation`` and no REST auth, NoAuthIdentityMiddleware copies the query
+    param onto ``request.state.user_id`` for scoping. Treating that as a principal let an
+    anonymous caller run any published tool.
+    """
+
+    def _ran() -> str:
+        """Returns a marker."""
+        return "ran"
+
+    os = AgentOS(agents=[_agent()], mcp=MCPConfig(tools=[_ran]), mcp_auth=_jwt_verifier(), user_isolation=True)
+    app = get_mcp_server(os)
+
+    async with _mcp_client(app, base_url="http://localhost") as client:
+        response = await client.post("/mcp/server/tools/_ran/run?user_id=attacker", json={"arguments": {}})
+
+    assert response.status_code == 401, response.text
+    assert response.json()["error"] == "unauthorized"
+    assert "ran" not in response.text
+
+
+async def test_tool_run_api_applies_the_authorize_predicate():
+    """``MCPConfig.authorize`` guards this route too.
+
+    Under ``mcp_auth`` the gate middleware is registered with ``only_path="/mcp"``, an exact
+    match that never covers ``/mcp/server/tools/...``. A caller the predicate rejects must
+    not be able to run tools here just because the transport is where the gate lives.
+    """
+
+    def _ran() -> str:
+        """Returns a marker."""
+        return "ran"
+
+    os = AgentOS(
+        agents=[_agent()],
+        mcp=MCPConfig(tools=[_ran], authorize=lambda user_id: False),
+        mcp_auth=_jwt_verifier(),
+        user_isolation=True,
+    )
+    app = get_mcp_server(os)
+
+    async with _mcp_client(app, base_url="http://localhost") as client:
+        response = await client.post("/mcp/server/tools/_ran/run?user_id=x", json={"arguments": {}})
+
+    assert response.status_code == 401, response.text
+    assert "ran" not in response.text
+
+
 def test_a_transport_path_may_not_sit_inside_another_paths_sub_routes():
     """Reserved sub-routes are a subtree, not one exact prefix.
 
